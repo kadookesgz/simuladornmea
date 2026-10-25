@@ -20,6 +20,7 @@ import threading
 import time
 import unicodedata
 import urllib.parse
+import webbrowser
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
@@ -1374,7 +1375,10 @@ def main():
     parser.add_argument("--web-port", type=int, default=DEFAULT_WEB_PORT)
     parser.add_argument("--web-host", default="0.0.0.0",
                         help="interfaz de la web (usa 127.0.0.1 para no exponer los controles en la red)")
+    parser.add_argument("--open", action="store_true",
+                        help="abrir la web en el navegador al arrancar (siempre activo en el .exe)")
     args = parser.parse_args()
+    frozen = bool(getattr(sys, "frozen", False))    # True dentro del .exe de PyInstaller
 
     print("=" * 65)
     print("  SIMULADOR NMEA 0183 - GPS, PROFUNDIDAD, AIS Y ARPA")
@@ -1392,12 +1396,16 @@ def main():
     try:
         httpd = ThreadedHTTPServer((args.web_host, args.web_port), FastHandler)
         print(f"[*] Servidor web disponible en http://localhost:{args.web_port}")
+        if args.open or frozen:
+            threading.Timer(1.0, webbrowser.open, (f"http://localhost:{args.web_port}/",)).start()
         httpd.serve_forever()
     except OSError as e:
         if e.errno in (errno.EADDRINUSE, 10048):
             print(f"[!] El puerto web {args.web_port} ya está en uso. Prueba con --web-port <otro puerto>.")
         else:
             print(f"[!] Error servidor HTTP: {e}")
+        if frozen:   # con doble clic la ventana se cerraría antes de poder leer el error
+            input("Pulsa Enter para cerrar...")
         sys.exit(1)
     except KeyboardInterrupt:
         print("\nServidor apagado.")
