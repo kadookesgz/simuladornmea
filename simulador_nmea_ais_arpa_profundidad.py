@@ -4,9 +4,12 @@ Simulador NMEA 0183 (GPS + profundidad + AIS + ARPA) con interfaz web.
 
 - Dibuja rutas con waypoints (arrastrables, clic derecho para borrar) y el barco las navega.
 - Modo manual opcional: avanzar a estima con el rumbo y la velocidad configurados.
-- Blancos sintéticos AIS (tipos 1 y 5) y ARPA (TTM con CPA/TCPA calculados).
+- Blancos sintéticos AIS (clase A, clase B, balizas AtoN, estación base, AIS-SART/MOB, mensajes
+  de seguridad) y ARPA (TTM con CPA/TCPA calculados).
+- Navegación de la ruta activa: RMB, APB, XTE, BOD, BWC, WPL y RTE.
+- Salidas adicionales por UDP y puerto serie (pyserial opcional) además de TCP.
 - Servidor web multihilo (por defecto :8085) y servidor TCP NMEA (por defecto :10111).
-- Sin dependencias de Python. La UI carga Leaflet y los mapas de OpenStreetMap desde Internet.
+- Sin dependencias de Python (pyserial solo si quieres salida por puerto serie). La UI carga Leaflet y los mapas de OpenStreetMap desde Internet.
 """
 
 import argparse
@@ -24,6 +27,12 @@ import webbrowser
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
+
+try:                                 # opcional: solo para la salida por puerto serie
+    import serial
+    import serial.tools.list_ports
+except ImportError:
+    serial = None
 
 DEFAULT_TCP_PORT = 10111
 DEFAULT_WEB_PORT = 8085
@@ -88,6 +97,31 @@ tcp_server_lock = threading.Lock()
 _static_last = {}            # mmsi -> instante (monotonic) del último AIS tipo 5
 _ais_seq = 0                 # identificador de secuencia para mensajes AIS multisentencia
 
+outputs_lock = threading.Lock()
+outputs = {}                 # id -> Sink (salidas UDP / serie además de TCP)
+MAX_OUTPUTS = 16
+safety_lock = threading.Lock()
+pending_safety = []          # mensajes AIS tipo 14 que se emiten una vez
+_nav_slow_last = -1e9        # instante del último envío de WPL/RTE
+NAV_SLOW_INTERVAL_S = 10.0
+MAX_ROUTE_SENTENCES = 60     # no emitir WPL/RTE si la ruta tiene más waypoints
+AIS_CLASSES = ("A", "B", "ATON", "BASE", "SART", "MOB")
+_refresh_gen = 0             # se incrementa al conectarse un cliente/salida nuevo
+_refresh_seen = {"ais": 0, "nav": 0}
+
+
+def request_static_refresh():
+    """Un cliente nuevo recibe de inmediato los mensajes lentos (nombres AIS, WPL/RTE)."""
+    global _refresh_gen
+    _refresh_gen += 1
+
+
+def _refresh_due(kind):
+    if _refresh_seen[kind] != _refresh_gen:
+        _refresh_seen[kind] = _refresh_gen
+        return True
+    return False
+
 
 # ----------------- CÁLCULOS NÁUTICOS -----------------
 def haversine_distance(lat1, lon1, lat2, lon2):
@@ -147,6 +181,82 @@ def target_metrics(own, t):
         cpa = dist_nm if t_h <= 0 else math.hypot(rx + vx * t_h, ry + vy * t_h)
         tcpa = max(-999.9, min(999.9, t_h * 60.0))
     return {"distance_nm": dist_nm, "bearing": bearing, "cpa_nm": cpa, "tcpa_min": tcpa}
+
+
+def cross_track_nm(o_lat, o_lon, d_lat, d_lon, p_lat, p_lon):
+    """Error de derrota (XTE) en millas. Positivo = el barco está a la derecha de la derrota origen->destino."""
+    d13 = haversine_distance(o_lat, o_lon, p_lat, p_lon) / R_EARTH_METERS
+    t13 = math.radians(calculate_bearing(o_lat, o_lon, p_lat, p_lon))
+    t12 = math.radians(calculate_bearing(o_lat, o_lon, d_lat, d_lon))
+    return math.asin(max(-1.0, min(1.0, math.sin(d13) * math.sin(t13 - t12)))) * R_EARTH_METERS / NM_M
+
+
+def wp_id(i):
+    return f"{i + 1:03d}"
+
+
+def compute_nav(lat, lon, sog, cog, wps, idx, loop):
+    """Datos del tramo activo (hacia wps[idx]). None si no hay ruta de al menos 2 waypoints."""
+    n = len(wps)
+    if n < 2 or not 0 <= idx < n:
+        return None
+    dest = wps[idx]
+    if idx >= 1:
+        oi = idx - 1
+    elif loop:
+        oi = n - 1
+    else:
+        oi = None
+    dist_m = haversine_distance(lat, lon, dest[0], dest[1])
+    bearing = calculate_bearing(lat, lon, dest[0], dest[1])
+    if oi is not None:
+        origin = wps[oi]
+        bearing_od = calculate_bearing(origin[0], origin[1], dest[0], dest[1])
+        xte = cross_track_nm(origin[0], origin[1], dest[0], dest[1], lat, lon)
+    else:
+        bearing_od, xte = bearing, 0.0
+    vmg = sog * math.cos(math.radians(bearing - cog))
+    ttg = dist_m / NM_M / vmg * 60.0 if vmg > 0.1 else None
+    return {"dest_idx": idx, "origin_idx": oi, "dest_id": wp_id(idx),
+            "origin_id": wp_id(oi) if oi is not None else "",
+            "dest": [dest[0], dest[1]], "dist_m": dist_m, "bearing": bearing,
+            "bearing_od": bearing_od, "xte_nm": xte, "vmg": vmg, "ttg_min": ttg}
+
+
+def _fmt_pos(lat, lon):
+    a, ah = deg_to_nmea(lat, True)
+    b, bh = deg_to_nmea(lon, False)
+    return f"{a},{ah},{b},{bh}"
+
+
+def build_nav_sentences(nav, wps, time_str):
+    global _nav_slow_last
+    xte_abs = min(abs(nav["xte_nm"]), 99.99)
+    steer = "L" if nav["xte_nm"] > 0 else "R"        # barco a la derecha de la derrota -> gobernar a la izquierda
+    arrived = "A" if nav["dist_m"] <= WP_ARRIVAL_M else "V"
+    dist_nm = min(nav["dist_m"] / NM_M, 999.9)
+    brg, brg_od = fmt_deg(nav["bearing"]), fmt_deg(nav["bearing_od"])
+    pos = _fmt_pos(*nav["dest"])
+    did, oid = nav["dest_id"], nav["origin_id"]
+    out = [
+        nmea_sentence(f"GPRMB,A,{xte_abs:.2f},{steer},{oid},{did},{pos},{dist_nm:.2f},{brg},{nav['vmg']:.1f},{arrived},A"),
+        nmea_sentence(f"GPAPB,A,A,{xte_abs:.2f},{steer},N,{arrived},{arrived},{brg_od},T,{did},{brg},T,{brg},T,A"),
+        nmea_sentence(f"GPXTE,A,A,{xte_abs:.2f},{steer},N,A"),
+        nmea_sentence(f"GPBOD,{brg_od},T,,M,{did},{oid}"),
+        nmea_sentence(f"GPBWC,{time_str},{pos},{brg},T,,M,{dist_nm:.2f},N,{did},A"),
+    ]
+    now_m = time.monotonic()
+    if _refresh_due("nav"):
+        _nav_slow_last = -1e9
+    if len(wps) <= MAX_ROUTE_SENTENCES and now_m - _nav_slow_last >= NAV_SLOW_INTERVAL_S:
+        _nav_slow_last = now_m
+        for i, w in enumerate(wps):
+            out.append(nmea_sentence(f"GPWPL,{_fmt_pos(w[0], w[1])},{wp_id(i)}"))
+        ids = [wp_id(i) for i in range(len(wps))]
+        chunks = [ids[i:i + 10] for i in range(0, len(ids), 10)]
+        for k, chunk in enumerate(chunks, 1):
+            out.append(nmea_sentence(f"GPRTE,{len(chunks)},{k},c,SIM,{','.join(chunk)}"))
+    return out
 
 
 # ----------------- NMEA 0183 -----------------
@@ -214,14 +324,21 @@ def _ais_sentences(bitstring):
     return out
 
 
-def encode_ais_type1(mmsi, lat, lon, speed_knots, course):
+def _pos_raw(lat, lon):
+    lon_raw = max(-108000000, min(108000000, int(round(lon * 600000))))
+    lat_raw = max(-54000000, min(54000000, int(round(lat * 600000))))
+    return lon_raw, lat_raw
+
+
+def encode_ais_type1(mmsi, lat, lon, speed_knots, course, nav_status=None):
     """AIS clase A, mensaje 1 (informe de posición), 168 bits."""
     lon_raw = max(-108000000, min(108000000, int(round(lon * 600000))))
     lat_raw = max(-54000000, min(54000000, int(round(lat * 600000))))
     sog = max(0, min(1022, int(round(speed_knots * 10))))
     cog = max(0, min(3599, int(round((course % 360) * 10))))
     hdg = int(round(course)) % 360
-    nav_status = 0 if speed_knots > 0.2 else 5            # 0 = navegando con motor, 5 = amarrado
+    if nav_status is None:
+        nav_status = 0 if speed_knots > 0.2 else 5        # 0 = navegando con motor, 5 = amarrado
     msg = "".join([
         _bits(1, 6), _bits(0, 2), _bits(mmsi, 30), _bits(nav_status, 4),
         _bits(-128, 8),                                    # ROT: no disponible
@@ -251,6 +368,86 @@ def encode_ais_type5(mmsi, name, ship_type=70):
     return _ais_sentences(msg)
 
 
+def encode_ais_type18(mmsi, lat, lon, speed_knots, course):
+    """AIS clase B CS, mensaje 18 (informe de posición), 168 bits."""
+    lon_raw, lat_raw = _pos_raw(lat, lon)
+    sog = max(0, min(1022, int(round(speed_knots * 10))))
+    cog = max(0, min(3599, int(round((course % 360) * 10))))
+    msg = "".join([
+        _bits(18, 6), _bits(0, 2), _bits(mmsi, 30), _bits(0, 8), _bits(sog, 10), _bits(0, 1),
+        _bits(lon_raw, 28), _bits(lat_raw, 27), _bits(cog, 12), _bits(int(round(course)) % 360, 9),
+        _bits(datetime.now(timezone.utc).second, 6), _bits(0, 2),
+        _bits(1, 1), _bits(0, 1), _bits(0, 1), _bits(1, 1), _bits(0, 1), _bits(0, 1), _bits(0, 1),
+        _bits(0, 20),
+    ])
+    assert len(msg) == 168
+    return _ais_sentences(msg)[0]
+
+
+def encode_ais_type24(mmsi, name, ship_type=37):
+    """AIS clase B, mensaje 24 (datos estáticos): parte A (nombre) y parte B (tipo y dimensiones)."""
+    part_a = "".join([_bits(24, 6), _bits(0, 2), _bits(mmsi, 30), _bits(0, 2), _ais_text(name, 20)])
+    part_b = "".join([
+        _bits(24, 6), _bits(0, 2), _bits(mmsi, 30), _bits(1, 2), _bits(ship_type, 8),
+        _ais_text("", 7), _ais_text("", 7),                # fabricante e indicativo: vacíos
+        _bits(12, 9), _bits(3, 9), _bits(2, 6), _bits(2, 6), _bits(0, 6),
+    ])
+    assert len(part_a) == 160 and len(part_b) == 168
+    return [_ais_sentences(part_a)[0], _ais_sentences(part_b)[0]]
+
+
+def encode_ais_type21(mmsi, name, lat, lon, aton_type):
+    """AIS mensaje 21 (ayuda a la navegación, AtoN), 272 bits."""
+    lon_raw, lat_raw = _pos_raw(lat, lon)
+    msg = "".join([
+        _bits(21, 6), _bits(0, 2), _bits(mmsi, 30), _bits(aton_type, 5), _ais_text(name, 20),
+        _bits(1, 1), _bits(lon_raw, 28), _bits(lat_raw, 27),
+        _bits(3, 9), _bits(3, 9), _bits(2, 6), _bits(2, 6),
+        _bits(1, 4), _bits(datetime.now(timezone.utc).second, 6), _bits(0, 1), _bits(0, 8),
+        _bits(0, 1), _bits(0, 1), _bits(0, 1), _bits(0, 1),
+    ])
+    assert len(msg) == 272
+    return _ais_sentences(msg)[0]
+
+
+def encode_ais_type4(mmsi, lat, lon):
+    """AIS mensaje 4 (informe de estación base con fecha y hora UTC), 168 bits."""
+    now = datetime.now(timezone.utc)
+    lon_raw, lat_raw = _pos_raw(lat, lon)
+    msg = "".join([
+        _bits(4, 6), _bits(0, 2), _bits(mmsi, 30), _bits(now.year, 14), _bits(now.month, 4),
+        _bits(now.day, 5), _bits(now.hour, 5), _bits(now.minute, 6), _bits(now.second, 6),
+        _bits(1, 1), _bits(lon_raw, 28), _bits(lat_raw, 27), _bits(1, 4), _bits(0, 10),
+        _bits(0, 1), _bits(0, 19),
+    ])
+    assert len(msg) == 168
+    return _ais_sentences(msg)[0]
+
+
+def clean_ais_text(text, limit):
+    """Texto compatible con el alfabeto de 6 bits de AIS (mayúsculas sin acentos)."""
+    t = unicodedata.normalize("NFKD", str(text)).encode("ascii", "ignore").decode("ascii").upper()
+    return "".join(ch for ch in t if ch in _AIS_CHARSET and ch != "@")[:limit].strip()
+
+
+def encode_ais_type14(mmsi, text):
+    """AIS mensaje 14 (mensaje de seguridad de difusión). Puede ocupar varias sentencias."""
+    text = clean_ais_text(text, 80) or "TEST"
+    msg = "".join([_bits(14, 6), _bits(0, 2), _bits(mmsi, 30), _bits(0, 2)]
+                  + [_bits(_AIS_CHARSET.index(ch), 6) for ch in text])
+    return _ais_sentences(msg)
+
+
+def drain_safety_messages():
+    with safety_lock:
+        items = list(pending_safety)
+        pending_safety.clear()
+    out = []
+    for it in items:
+        out.extend(encode_ais_type14(it["mmsi"], it["text"]))
+    return out
+
+
 # ----- Sentencias compuestas -----
 def build_depth_sentences(depth_m: float):
     depth_ft = depth_m * 3.280839895
@@ -271,17 +468,39 @@ def build_ttm(t, m, time_str):
 def build_target_sentences(target_list, own, time_str):
     out = []
     now_m = time.monotonic()
+    if _refresh_due("ais"):
+        _static_last.clear()
     live = {t["mmsi"] for t in target_list}
     for mmsi in [k for k in _static_last if k not in live]:
         del _static_last[mmsi]
     for t in target_list:
         if t.get("arpa", True):
             out.append(build_ttm(t, target_metrics(own, t), time_str))
-        if t.get("ais", True):
-            out.append(encode_ais_type1(t["mmsi"], t["lat"], t["lon"], t["speed"], t["heading"]))
-            if now_m - _static_last.get(t["mmsi"], -1e9) >= STATIC_AIS_INTERVAL_S:
-                out.extend(encode_ais_type5(t["mmsi"], t["name"]))
-                _static_last[t["mmsi"]] = now_m
+        if not t.get("ais", True):
+            continue
+        cls = t.get("ais_class", "A")
+        mmsi, lat, lon = t["mmsi"], t["lat"], t["lon"]
+        due = now_m - _static_last.get(mmsi, -1e9) >= STATIC_AIS_INTERVAL_S
+        if cls == "A":
+            out.append(encode_ais_type1(mmsi, lat, lon, t["speed"], t["heading"]))
+            if due:
+                out.extend(encode_ais_type5(mmsi, t["name"]))
+        elif cls == "B":
+            out.append(encode_ais_type18(mmsi, lat, lon, t["speed"], t["heading"]))
+            if due:
+                out.extend(encode_ais_type24(mmsi, t["name"]))
+        elif cls == "ATON":
+            if due:
+                out.append(encode_ais_type21(mmsi, t["name"], lat, lon, int(t.get("aton_type", 0))))
+        elif cls == "BASE":
+            if due:
+                out.append(encode_ais_type4(mmsi, lat, lon))
+        elif cls in ("SART", "MOB"):
+            out.append(encode_ais_type1(mmsi, lat, lon, t["speed"], t["heading"], nav_status=14))
+            if due:
+                out.extend(encode_ais_type14(mmsi, f"{cls} ACTIVE"))
+        if due:
+            _static_last[mmsi] = now_m
     return out
 
 
@@ -307,9 +526,19 @@ def build_nmea():
         nmea_sentence(f"HEHDT,{hdg},T"),
     ]
     sentences.extend(build_depth_sentences(depth))
+    with route_lock:
+        navigating = route_state["is_navigating"]
+        wps = [list(pt) for pt in route_state["waypoints"]]
+        idx = route_state["current_wp_idx"]
+        loop = route_state["loop_route"]
+    if navigating:
+        nav = compute_nav(lat, lon, sog, heading, wps, idx, loop)
+        if nav:
+            sentences.extend(build_nav_sentences(nav, wps, time_str))
     with targets_lock:
         target_snapshot = [dict(t) for t in targets]
     sentences.extend(build_target_sentences(target_snapshot, (lat, lon, sog, heading), time_str))
+    sentences.extend(drain_safety_messages())
     return sentences
 
 
@@ -437,7 +666,132 @@ def accept_worker():
         with state_lock:
             gps_state["connected_clients"] = cnt
         client.start()
+        request_static_refresh()
         print(f"[+] [CLIENTE CONECTADO] {addr[0]}:{addr[1]} | Clientes activos: {cnt}")
+
+
+# ----------------- SALIDAS UDP / SERIE -----------------
+class Sink:
+    """Salida adicional. Cola y hilo propios: un destino lento o caído no afecta al resto."""
+    kind = "?"
+
+    def __init__(self, ident, label, queue_size=3):
+        self.id, self.label = ident, label
+        self.alive = True
+        self.sent = 0
+        self.dropped = 0
+        self.error = ""
+        self.q = queue.Queue(maxsize=queue_size)
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def send(self, lines):
+        if self.alive:
+            try:
+                self.q.put_nowait(lines)
+            except queue.Full:
+                self.dropped += len(lines)
+
+    def close(self):
+        self.alive = False
+        try:
+            self._close()
+        except Exception:   # noqa: BLE001
+            pass
+
+    def _close(self):
+        pass
+
+    def _run(self):
+        try:
+            while self.alive and not stop_event.is_set():
+                try:
+                    lines = self.q.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                self._write(lines)
+        except Exception as e:   # noqa: BLE001
+            self.error = str(e)
+            print(f"[!] [SALIDA {self.label}] cerrada: {e}")
+            with state_lock:
+                gps_state["status_msg"] = f"Salida {self.label} cerrada: {e}"
+        finally:
+            self.close()
+            with outputs_lock:
+                if outputs.get(self.id) is self:
+                    del outputs[self.id]
+
+    def info(self):
+        return {"id": self.id, "kind": self.kind, "label": self.label, "sent": self.sent,
+                "dropped": self.dropped, "error": self.error}
+
+
+class UdpSink(Sink):
+    kind = "udp"
+
+    def __init__(self, host, port):
+        super().__init__(f"udp:{host}:{port}", f"UDP {host}:{port}")
+        family, _, _, _, self.addr = socket.getaddrinfo(host, port, type=socket.SOCK_DGRAM)[0]
+        self.sock = socket.socket(family, socket.SOCK_DGRAM)
+        if family == socket.AF_INET:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+    def _write(self, lines):
+        for line in lines:        # una sentencia por datagrama: lo más compatible
+            try:
+                self.sock.sendto((line + "\r\n").encode("ascii", "replace"), self.addr)
+                self.sent += 1
+            except OSError as e:
+                self.dropped += 1
+                self.error = str(e)
+
+    def _close(self):
+        self.sock.close()
+
+
+class SerialSink(Sink):
+    kind = "serial"
+
+    def __init__(self, port, baud):
+        if serial is None:
+            raise ValueError("Falta pyserial para la salida serie (pip install pyserial)")
+        super().__init__(f"serial:{port}", f"Serie {port} @ {baud}", queue_size=2)
+        self.ser = serial.Serial(port, baud, timeout=0, write_timeout=2)
+
+    def _write(self, lines):
+        for line in lines:
+            try:
+                self.ser.write((line + "\r\n").encode("ascii", "replace"))
+                self.sent += 1
+            except serial.SerialTimeoutException:
+                self.dropped += 1       # el puerto no da abasto a esa velocidad (baudios)
+
+    def _close(self):
+        self.ser.close()
+
+
+def outputs_info():
+    with outputs_lock:
+        return [o.info() for o in outputs.values()]
+
+
+def add_output(sink):
+    with outputs_lock:
+        if sink.id in outputs or len(outputs) >= MAX_OUTPUTS:
+            dup = sink.id in outputs
+            sink.close()
+            raise ValueError("Esa salida ya existe" if dup else f"Máximo {MAX_OUTPUTS} salidas")
+        outputs[sink.id] = sink
+    sink.start()
+    request_static_refresh()
+    print(f"[*] [SALIDA] {sink.label} activa")
+
+
+def list_serial_ports():
+    if serial is None:
+        return []
+    return sorted(p.device for p in serial.tools.list_ports.comports())
 
 
 # ----------------- MOTOR DE NAVEGACIÓN -----------------
@@ -508,6 +862,10 @@ def broadcast_nmea():
         clients = list(tcp_clients)
     for c in clients:
         c.send(payload)
+    with outputs_lock:
+        sinks = list(outputs.values())
+    for sink in sinks:
+        sink.send(sentences)
 
 
 def navigation_and_broadcast_worker():
@@ -622,14 +980,25 @@ def api_set_depth(body):
 def api_add_target(body):
     lat = _num(body, "lat", -90, 90)
     lon = _num(body, "lon", -180, 180)
+    cls = str(body.get("ais_class", "A")).upper()
+    if cls not in AIS_CLASSES:
+        raise ValueError("Clase AIS inválida: " + ", ".join(AIS_CLASSES))
     try:
         mmsi = int(body["mmsi"])
     except (TypeError, ValueError):
         raise ValueError("MMSI inválido") from None
-    if not 100000000 <= mmsi <= 999999999:
+    if cls == "BASE":
+        if not 1000000 <= mmsi <= 9999999:
+            raise ValueError("MMSI de estación base: 00 + MID + 4 cifras (p. ej. 2241001)")
+    elif not 100000000 <= mmsi <= 999999999:
         raise ValueError("MMSI debe tener 9 cifras")
-    speed = _num(body, "speed", 0, 102.2, default=0.0)
-    heading = _num(body, "heading", 0, 360, default=0.0) % 360.0
+    prefix = {"SART": "970", "MOB": "972", "ATON": "99"}.get(cls)
+    if prefix and not str(mmsi).startswith(prefix):
+        raise ValueError(f"El MMSI de {cls} debe empezar por {prefix}")
+    fixed = cls in ("ATON", "BASE")
+    speed = 0.0 if fixed else _num(body, "speed", 0, 102.2, default=0.0)
+    heading = 0.0 if fixed else _num(body, "heading", 0, 360, default=0.0) % 360.0
+    aton_type = int(_num(body, "aton_type", 0, 31, default=0))
     arpa, ais = bool(body.get("arpa", True)), bool(body.get("ais", True))
     if not arpa and not ais:
         raise ValueError("Activa AIS, ARPA o ambos")
@@ -641,9 +1010,67 @@ def api_add_target(body):
         used = {t["id"] for t in targets}
         tid = next(i for i in range(1, 100) if i not in used)    # nº de blanco TTM (1-99)
         target = {"id": tid, "lat": lat, "lon": lon, "mmsi": mmsi, "name": _clean_name(body.get("name", "")),
-                  "speed": speed, "heading": heading, "arpa": arpa, "ais": ais}
+                  "speed": speed, "heading": heading, "arpa": arpa, "ais": ais,
+                  "ais_class": cls, "aton_type": aton_type}
         targets.append(target)
     return {"status": "ok", "target": target}
+
+
+def api_ais_safety(body):
+    try:
+        mmsi = int(body["mmsi"])
+    except (TypeError, ValueError, KeyError):
+        raise ValueError("MMSI inválido") from None
+    if not 1 <= mmsi <= 999999999:
+        raise ValueError("MMSI fuera de rango")
+    text = clean_ais_text(body.get("text", ""), 80)
+    if not text:
+        raise ValueError("Escribe un texto (mayúsculas, números y signos básicos)")
+    with safety_lock:
+        if len(pending_safety) >= 20:
+            raise ValueError("Demasiados mensajes pendientes")
+        pending_safety.append({"mmsi": mmsi, "text": text})
+    return {"status": "ok", "text": text}
+
+
+def api_add_udp(body):
+    host = str(body.get("host", "")).strip()
+    if not host:
+        raise ValueError("Indica un host o IP")
+    port = int(_num(body, "port", 1, 65535))
+    try:
+        sink = UdpSink(host, port)
+    except OSError as e:
+        raise ValueError(f"No se pudo crear la salida UDP: {e}") from None
+    add_output(sink)
+    return {"status": "ok", "id": sink.id}
+
+
+def api_add_serial(body):
+    port = str(body.get("port", "")).strip()
+    if not port:
+        raise ValueError("Indica el puerto serie (COM3, /dev/ttyUSB0...)")
+    baud = int(_num(body, "baud", 300, 4000000, default=38400))
+    try:
+        sink = SerialSink(port, baud)
+    except OSError as e:
+        raise ValueError(f"No se pudo abrir {port}: {e}") from None
+    except Exception as e:   # noqa: BLE001  (serial.SerialException y similares)
+        if isinstance(e, ValueError):
+            raise
+        raise ValueError(f"No se pudo abrir {port}: {e}") from None
+    add_output(sink)
+    return {"status": "ok", "id": sink.id}
+
+
+def api_remove_output(body):
+    ident = str(body.get("id", ""))
+    with outputs_lock:
+        sink = outputs.pop(ident, None)
+    if sink is None:
+        raise ValueError("Esa salida no existe")
+    sink.close()
+    return {"status": "ok"}
 
 
 def api_delete_target(body):
@@ -673,6 +1100,10 @@ POST_ROUTES = {
     "/targets": api_add_target,
     "/targets/delete": api_delete_target,
     "/targets/clear": api_clear_targets,
+    "/ais_safety": api_ais_safety,
+    "/outputs/udp": api_add_udp,
+    "/outputs/serial": api_add_serial,
+    "/outputs/remove": api_remove_output,
 }
 
 
@@ -696,6 +1127,13 @@ def snapshot_status():
             "waypoints": [list(p) for p in route_state["waypoints"]],
         }
     st["targets"] = targets_with_metrics((st["lat"], st["lon"], st["sog_knots"], st["heading"]))
+    ri = st["route_info"]
+    st["nav"] = None
+    if ri["is_navigating"]:
+        st["nav"] = compute_nav(st["lat"], st["lon"], st["sog_knots"], st["heading"],
+                                ri["waypoints"], ri["current_wp_idx"], ri["loop_route"])
+    st["outputs"] = outputs_info()
+    st["serial_available"] = serial is not None
     return st
 
 
@@ -755,7 +1193,7 @@ HTML = r"""<!DOCTYPE html>
     .btn-red:hover { background: #dc2626; }
     .btn-amber { background: #f59e0b; }
     .btn-amber:hover { background: #d97706; }
-    input[type="number"], input[type="text"] { background: #0b111e; border: 1px solid #475569; color: #f8fafc; padding: 5px 7px; border-radius: 4px; font-size: 12px; }
+    input[type="number"], input[type="text"], select { background: #0b111e; border: 1px solid #475569; color: #f8fafc; padding: 5px 7px; border-radius: 4px; font-size: 12px; }
     .btn-group { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
     .pill { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; padding: 2px 6px; border-radius: 4px; background: #0b111e; color: #94a3b8; }
     .tgt-tip { background: #0b111e; color: #fda4af; border: 1px solid #334155; font-size: 10px; padding: 1px 4px; box-shadow: none; }
@@ -776,7 +1214,7 @@ HTML = r"""<!DOCTYPE html>
     .mobile .btn { padding: 10px 14px; font-size: 14px; min-height: 42px; }
     .mobile .btn-group .btn { flex: 1 1 auto; }
     .mobile .tgt-row .btn { padding: 4px 12px !important; min-height: 34px; }
-    .mobile input[type="number"], .mobile input[type="text"] { font-size: 16px; padding: 9px 8px; }  /* 16px evita el zoom de iOS */
+    .mobile input[type="number"], .mobile input[type="text"], .mobile select { font-size: 16px; padding: 9px 8px; }  /* 16px evita el zoom de iOS */
     .mobile input[type="checkbox"] { width: 20px; height: 20px; flex: none; }
     .mobile #side [style*="font-size"] { font-size: 12.5px !important; }   /* unifica los textos de 10-11px del panel */
     .mobile .feed { height: 140px; font-size: 11px; }
@@ -824,6 +1262,12 @@ HTML = r"""<!DOCTYPE html>
         </div>
       </div>
 
+      <!-- NAVEGACIÓN A LA RUTA -->
+      <div class="card" style="border-left:4px solid #34d399;">
+        <div style="font-size:11px;font-weight:bold;color:#34d399;margin-bottom:4px;">🧭 NAVEGACIÓN (RMB · APB · XTE · BOD · BWC)</div>
+        <div id="nav-detail" style="font-family:monospace;font-size:11.5px;color:#cbd5e1;line-height:1.5;">Sin ruta activa</div>
+      </div>
+
       <!-- VELOCIDAD Y RUMBO -->
       <div class="card" style="border-left: 4px solid #f59e0b;">
         <div style="font-size:11px;font-weight:bold;color:#fbbf24;margin-bottom:6px;">⚡ CINEMÁTICA / VELOCIDAD</div>
@@ -854,6 +1298,24 @@ HTML = r"""<!DOCTYPE html>
         <div id="port-status" style="font-size:10.5px; color:#38bdf8; margin-top:4px;">Puerto activo: 10111</div>
       </div>
 
+      <!-- SALIDAS UDP / SERIE -->
+      <div class="card" style="border-left:4px solid #22d3ee;">
+        <div style="font-size:11px;font-weight:bold;color:#67e8f9;margin-bottom:4px;">📡 SALIDAS UDP / SERIE (además de TCP)</div>
+        <div style="display:flex;gap:6px;">
+          <input id="o-udp-host" type="text" value="255.255.255.255" style="flex:1;min-width:0;">
+          <input id="o-udp-port" type="number" value="10110" min="1" max="65535" style="width:84px;">
+          <button class="btn" onclick="addUdp()">UDP ＋</button>
+        </div>
+        <div style="display:flex;gap:6px;margin-top:6px;">
+          <input id="o-ser-port" type="text" list="ser-ports" placeholder="COM3 o /dev/ttyUSB0" style="flex:1;min-width:0;">
+          <datalist id="ser-ports"></datalist>
+          <select id="o-ser-baud" style="width:88px;"><option>4800</option><option selected>38400</option><option>115200</option></select>
+          <button class="btn" id="btn-add-serial" onclick="addSerial()">Serie ＋</button>
+        </div>
+        <div id="o-hint" style="font-size:10px;color:#94a3b8;margin-top:4px;"></div>
+        <div id="o-list" style="font-size:10.5px;color:#cbd5e1;margin-top:6px;"></div>
+      </div>
+
       <!-- PROFUNDIDAD -->
       <div class="card" style="border-left:4px solid #a78bfa;">
         <div style="font-size:11px;font-weight:bold;color:#c4b5fd;margin-bottom:6px;">🌊 PROFUNDIDAD SIMULADA</div>
@@ -869,6 +1331,31 @@ HTML = r"""<!DOCTYPE html>
       <div class="card" style="border-left:4px solid #fb7185;">
         <div style="font-size:11px;font-weight:bold;color:#fda4af;margin-bottom:6px;">🎯 BLANCOS AIS / ARPA</div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:5px;">
+          <label style="font-size:10px;color:#94a3b8;">Clase AIS
+            <select id="t-class" onchange="onClassChange()" style="width:100%;">
+              <option value="A">A · buque</option>
+              <option value="B">B · pequeña embarcación</option>
+              <option value="ATON">AtoN · baliza / boya</option>
+              <option value="BASE">Estación base</option>
+              <option value="SART">AIS-SART (socorro)</option>
+              <option value="MOB">MOB (hombre al agua)</option>
+            </select>
+          </label>
+          <label id="t-aton-wrap" style="font-size:10px;color:#94a3b8;display:none;">Tipo de baliza
+            <select id="t-aton" style="width:100%;">
+              <option value="24">Lateral babor</option>
+              <option value="25">Lateral estribor</option>
+              <option value="20">Cardinal norte</option>
+              <option value="21">Cardinal este</option>
+              <option value="22">Cardinal sur</option>
+              <option value="23">Cardinal oeste</option>
+              <option value="28" selected>Peligro aislado</option>
+              <option value="29">Aguas navegables</option>
+              <option value="30">Marca especial</option>
+              <option value="5">Luz sin sectores</option>
+              <option value="1">Punto de referencia</option>
+            </select>
+          </label>
           <label style="font-size:10px;color:#94a3b8;">Latitud<input id="t-lat" type="number" step="0.0001" value="43.6900" style="width:100%;"></label>
           <label style="font-size:10px;color:#94a3b8;">Longitud<input id="t-lon" type="number" step="0.0001" value="-7.5800" style="width:100%;"></label>
           <label style="font-size:10px;color:#94a3b8;">MMSI<input id="t-mmsi" type="number" min="100000000" max="999999999" value="224123456" style="width:100%;"></label>
@@ -883,7 +1370,12 @@ HTML = r"""<!DOCTYPE html>
         <div class="btn-group">
           <button class="btn btn-amber" id="btn-pick" onclick="togglePick()">📍 Elegir en mapa</button>
           <button class="btn" onclick="addTarget()">＋ Añadir blanco</button>
+          <button class="btn btn-red" onclick="dropMOB()">🆘 MOB aquí</button>
           <button class="btn btn-red" onclick="clearTargets()">Eliminar todos</button>
+        </div>
+        <div style="display:flex;gap:6px;margin-top:8px;">
+          <input id="t-safety" type="text" maxlength="80" placeholder="Mensaje de seguridad AIS (tipo 14), con el MMSI del formulario" style="flex:1;min-width:0;">
+          <button class="btn" onclick="sendSafety()">Enviar</button>
         </div>
         <div style="font-size:10px;color:#cbd5e1;margin-top:6px;">
           <div id="target-empty">Sin blancos</div>
@@ -1150,9 +1642,21 @@ HTML = r"""<!DOCTYPE html>
     }
 
     function targetIcon(t) {
+      const c = t.ais_class || 'A';
+      let svg, rot = 0;
+      if (c === 'ATON') {
+        svg = '<svg width="22" height="22" viewBox="0 0 24 24"><path d="M12 2l9 10-9 10-9-10z" fill="#22d3ee" stroke="#0b111e" stroke-width="2"/></svg>';
+      } else if (c === 'BASE') {
+        svg = '<svg width="22" height="22" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" fill="#a78bfa" stroke="#0b111e" stroke-width="2"/></svg>';
+      } else if (c === 'SART' || c === 'MOB') {
+        svg = '<svg width="26" height="26" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8" fill="none" stroke="#ef4444" stroke-width="3"/><circle cx="12" cy="12" r="3" fill="#ef4444"/></svg>';
+      } else {
+        rot = t.heading;
+        svg = `<svg width="22" height="22" viewBox="0 0 24 24" fill="${c === 'B' ? '#fbbf24' : '#fb7185'}" stroke="#0b111e" stroke-width="1.6"><path d="M12 2L5 21l7-3 7 3z"/></svg>`;
+      }
       return L.divIcon({
         className: '',
-        html: `<div style="transform: rotate(${t.heading}deg)"><svg width="22" height="22" viewBox="0 0 24 24" fill="#fb7185" stroke="#0b111e" stroke-width="1.6"><path d="M12 2L5 21l7-3 7 3z"/></svg></div>`,
+        html: `<div style="transform: rotate(${rot}deg)">${svg}</div>`,
         iconSize: [22, 22],
         iconAnchor: [11, 11]
       });
@@ -1183,7 +1687,7 @@ HTML = r"""<!DOCTYPE html>
         }
         const tc = t.tcpa_min === null ? '–' : t.tcpa_min.toFixed(1);
         row.querySelector('.info').innerHTML =
-          `${esc(t.name)} · ${t.mmsi} · ${t.speed.toFixed(1)} kn<br>` +
+          `${esc(t.name)} [${esc(t.ais_class || 'A')}] · ${String(t.mmsi).padStart(9, '0')} · ${t.speed.toFixed(1)} kn<br>` +
           `<span style="color:#94a3b8">${t.distance_nm.toFixed(2)} nm · CPA ${t.cpa_nm.toFixed(2)} nm · TCPA ${tc} min</span>`;
       });
       for (const [id, m] of targetMarkers) if (!seen.has(id)) { map.removeLayer(m); targetMarkers.delete(id); }
@@ -1196,7 +1700,8 @@ HTML = r"""<!DOCTYPE html>
         lat: parseFloat($('t-lat').value), lon: parseFloat($('t-lon').value),
         mmsi: parseInt($('t-mmsi').value), name: $('t-name').value || 'BLANCO',
         speed: parseFloat($('t-speed').value), heading: parseFloat($('t-heading').value),
-        arpa: $('t-arpa').checked, ais: $('t-ais').checked
+        arpa: $('t-arpa').checked, ais: $('t-ais').checked,
+        ais_class: $('t-class').value, aton_type: parseInt($('t-aton').value)
       };
       const r = await postJSON('/targets', data);
       const d = await r.json();
@@ -1204,6 +1709,94 @@ HTML = r"""<!DOCTYPE html>
       $('t-mmsi').value = Math.min(999999999, data.mmsi + 1);
       pollStatus();
     }
+
+    const CLASS_DEFAULTS = {
+      A: {mmsi: 224123456, arpa: true}, B: {mmsi: 224123457, arpa: true},
+      ATON: {mmsi: 992241001, arpa: false}, BASE: {mmsi: 2241001, arpa: false},
+      SART: {mmsi: 970000001, arpa: true}, MOB: {mmsi: 972000001, arpa: true}
+    };
+
+    function onClassChange() {
+      const c = $('t-class').value, d = CLASS_DEFAULTS[c];
+      const fixed = c === 'ATON' || c === 'BASE';
+      $('t-mmsi').value = d.mmsi;
+      $('t-arpa').checked = d.arpa;
+      $('t-aton-wrap').style.display = c === 'ATON' ? '' : 'none';
+      if (fixed) { $('t-speed').value = 0; }
+      $('t-speed').disabled = fixed;
+      $('t-heading').disabled = fixed;
+    }
+
+    async function dropMOB() {
+      const mmsi = 972000000 + 1 + Math.floor(Math.random() * 900000);
+      const r = await postJSON('/targets', {
+        lat: lat, lon: lon, mmsi: mmsi, name: 'MOB', speed: 0.5, heading: Math.floor(Math.random() * 360),
+        arpa: true, ais: true, ais_class: 'MOB'
+      });
+      const d = await r.json();
+      if (!r.ok) alert(d.message || 'No se pudo crear el MOB'); else pollStatus();
+    }
+
+    async function sendSafety() {
+      const text = $('t-safety').value.trim();
+      if (!text) return;
+      const r = await postJSON('/ais_safety', {mmsi: parseInt($('t-mmsi').value), text: text});
+      const d = await r.json();
+      if (!r.ok) alert(d.message || 'No se pudo enviar'); else $('t-safety').value = '';
+    }
+
+    // ---------- Navegación de la ruta ----------
+    function renderNav(n) {
+      const el = $('nav-detail');
+      if (!n) { el.innerText = 'Sin ruta activa'; return; }
+      const steer = n.xte_nm > 0 ? 'L' : (n.xte_nm < 0 ? 'R' : '');
+      el.innerHTML =
+        `Destino WP ${esc(n.dest_id)}${n.origin_id ? ' (desde ' + esc(n.origin_id) + ')' : ''}<br>` +
+        `Dist ${(n.dist_m / 1852).toFixed(2)} nm · Demora ${Math.round(n.bearing)}°<br>` +
+        `XTE ${Math.abs(n.xte_nm).toFixed(3)} nm ${steer} · VMG ${n.vmg.toFixed(1)} kn<br>` +
+        `TTG ${n.ttg_min === null ? '–' : n.ttg_min.toFixed(1) + ' min'}`;
+    }
+
+    // ---------- Salidas UDP / serie ----------
+    async function addUdp() {
+      const r = await postJSON('/outputs/udp', {host: $('o-udp-host').value.trim(), port: parseInt($('o-udp-port').value)});
+      const d = await r.json();
+      if (!r.ok) alert(d.message || 'No se pudo crear la salida UDP');
+      pollStatus();
+    }
+
+    async function addSerial() {
+      const r = await postJSON('/outputs/serial', {port: $('o-ser-port').value.trim(), baud: parseInt($('o-ser-baud').value)});
+      const d = await r.json();
+      if (!r.ok) alert(d.message || 'No se pudo abrir el puerto serie');
+      pollStatus();
+    }
+
+    async function removeOutput(id) {
+      await postJSON('/outputs/remove', {id: id});
+      pollStatus();
+    }
+
+    async function loadSerialPorts() {
+      try {
+        const d = await (await fetch('/serial_ports')).json();
+        $('ser-ports').innerHTML = d.ports.map(p => `<option value="${esc(p)}">`).join('');
+      } catch (e) {}
+    }
+
+    function renderOutputs(list, serialOk) {
+      $('btn-add-serial').disabled = !serialOk;
+      $('o-hint').innerText = serialOk
+        ? 'UDP: una sentencia por datagrama. Serie: NMEA estándar 4800, AIS 38400; a 4800 baudios se descartan tramas si hay muchos blancos.'
+        : 'Salida serie no disponible: falta pyserial (pip install pyserial). UDP funciona sin él.';
+      $('o-list').innerHTML = list.length ? list.map(o =>
+        `<div class="tgt-row"><span>${esc(o.label)}<br><span style="color:#94a3b8">${o.sent} enviadas · ${o.dropped} descartadas${o.error ? ' · ' + esc(o.error) : ''}</span></span>` +
+        `<button class="btn btn-red" data-id="${esc(o.id)}" style="padding:1px 7px">✕</button></div>`).join('') : '';
+    }
+    $('o-list').addEventListener('click', e => {
+      const b = e.target.closest('button');
+      if (b && b.dataset.id) removeOutput(b.dataset.id);
+    });
 
     async function deleteTarget(id) {
       await postJSON('/targets/delete', {id});
@@ -1251,6 +1844,8 @@ HTML = r"""<!DOCTYPE html>
               : (ri.total_wps > 0 ? 'Ruta detenida' : 'WP objetivo: -');
           }
 
+          renderNav(d.nav);
+          renderOutputs(d.outputs || [], !!d.serial_available);
           renderTargets(d.targets || []);
           if (d.latest_sentences && d.latest_sentences.length) {
             $('feed').textContent = d.latest_sentences.join('\n');
@@ -1262,6 +1857,7 @@ HTML = r"""<!DOCTYPE html>
     // Al abrir/recargar la página se restaura el estado real del servidor (ruta, velocidad, etc.).
     async function initFromServer() {
       $('host-ip').innerText = location.hostname || '127.0.0.1';
+      loadSerialPorts();
       try {
         const d = await (await fetch('/status')).json();
         $('in-speed').value = d.speed_knots;
@@ -1316,6 +1912,8 @@ class FastHandler(BaseHTTPRequestHandler):
             self._send(200, HTML.encode("utf-8"), "text/html; charset=utf-8")
         elif path == "/status":
             self._send(200, snapshot_status(), cors=True)
+        elif path == "/serial_ports":
+            self._send(200, {"available": serial is not None, "ports": list_serial_ports()})
         elif path == "/targets":
             with state_lock:
                 own = (gps_state["lat"], gps_state["lon"], gps_state["sog_knots"], gps_state["heading"])
@@ -1375,6 +1973,10 @@ def main():
     parser.add_argument("--web-port", type=int, default=DEFAULT_WEB_PORT)
     parser.add_argument("--web-host", default="0.0.0.0",
                         help="interfaz de la web (usa 127.0.0.1 para no exponer los controles en la red)")
+    parser.add_argument("--udp", action="append", default=[], metavar="HOST:PUERTO",
+                        help="enviar también por UDP (repetible), p. ej. --udp 255.255.255.255:10110")
+    parser.add_argument("--serial", action="append", default=[], metavar="PUERTO[:BAUDIOS]",
+                        help="enviar también por puerto serie (repetible, requiere pyserial), p. ej. --serial COM3:38400")
     parser.add_argument("--open", action="store_true",
                         help="abrir la web en el navegador al arrancar (siempre activo en el .exe)")
     args = parser.parse_args()
@@ -1391,6 +1993,23 @@ def main():
         print("[!] El simulador arranca sin servidor TCP; elige otro puerto desde la web.")
     threading.Thread(target=accept_worker, daemon=True).start()
     threading.Thread(target=navigation_and_broadcast_worker, daemon=True).start()
+
+    for spec in args.udp:
+        try:
+            host, _, prt = spec.rpartition(":")
+            add_output(UdpSink(host, int(prt)))
+        except (ValueError, OSError) as e:
+            print(f"[!] --udp {spec}: {e}")
+    for spec in args.serial:
+        try:
+            port, baud = spec, 38400
+            if ":" in spec and spec.rsplit(":", 1)[1].isdigit():
+                port, baud = spec.rsplit(":", 1)[0], int(spec.rsplit(":", 1)[1])
+            add_output(SerialSink(port, baud))
+        except (ValueError, OSError) as e:
+            print(f"[!] --serial {spec}: {e}")
+        except Exception as e:   # noqa: BLE001
+            print(f"[!] --serial {spec}: {e}")
 
     httpd = None
     try:
@@ -1417,6 +2036,10 @@ def main():
             clients = list(tcp_clients)
         for c in clients:
             c.close()
+        with outputs_lock:
+            sinks = list(outputs.values())
+        for sink in sinks:
+            sink.close()
         if tcp_server_sock:
             try:
                 tcp_server_sock.close()

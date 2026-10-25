@@ -18,14 +18,14 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Instalar PyInstaller
-        run: python -m pip install pyinstaller
+      - name: Instalar PyInstaller y pyserial (salida por puerto serie)
+        run: python -m pip install pyinstaller pyserial
 
       - name: Comprobar que el script compila
         run: python -m py_compile simulador_nmea_ais_arpa_profundidad.py
 
       - name: Generar .exe
-        run: pyinstaller --onefile --name SimuladorNMEA simulador_nmea_ais_arpa_profundidad.py
+        run: pyinstaller --onefile --name SimuladorNMEA --collect-submodules serial simulador_nmea_ais_arpa_profundidad.py
 
       - uses: actions/upload-artifact@v4
         with:
