@@ -8,11 +8,14 @@ Simulador NMEA 0183 (GPS + profundidad + AIS + ARPA) con interfaz web.
   de seguridad) y ARPA (TTM con CPA/TCPA calculados).
 - Navegación de la ruta activa: RMB, APB, XTE, BOD, BWC, WPL y RTE.
 - Salidas adicionales por UDP y puerto serie (pyserial opcional) además de TCP.
+- Pantalla /miniguard: simulación de un anunciador de alarmas de 8 canales (tipo Praxis Mini-Guard 008)
+  que emite sus alarmas como sentencias NMEA 0183 ALR.
 - Servidor web multihilo (por defecto :8085) y servidor TCP NMEA (por defecto :10111).
 - Sin dependencias de Python (pyserial solo si quieres salida por puerto serie). La UI carga Leaflet y los mapas de OpenStreetMap desde Internet.
 """
 
 import argparse
+import collections
 import errno
 import json
 import math
@@ -107,7 +110,7 @@ NAV_SLOW_INTERVAL_S = 10.0
 MAX_ROUTE_SENTENCES = 60     # no emitir WPL/RTE si la ruta tiene más waypoints
 AIS_CLASSES = ("A", "B", "ATON", "BASE", "SART", "MOB")
 _refresh_gen = 0             # se incrementa al conectarse un cliente/salida nuevo
-_refresh_seen = {"ais": 0, "nav": 0}
+_refresh_seen = {"ais": 0, "nav": 0, "mg": 0}
 
 
 def request_static_refresh():
@@ -539,6 +542,7 @@ def build_nmea():
         target_snapshot = [dict(t) for t in targets]
     sentences.extend(build_target_sentences(target_snapshot, (lat, lon, sog, heading), time_str))
     sentences.extend(drain_safety_messages())
+    sentences.extend(mg_sentences())
     return sentences
 
 
@@ -668,6 +672,148 @@ def accept_worker():
         client.start()
         request_static_refresh()
         print(f"[+] [CLIENTE CONECTADO] {addr[0]}:{addr[1]} | Clientes activos: {cnt}")
+
+
+# ----------------- MINI-GUARD 008: anunciador de alarmas de 8 canales -----------------
+# Simulación de un anunciador de 8 canales con LED por canal, entradas NA/NC, retardo individual por canal,
+# detección de cable roto y botones de prueba, aceptar y parar bocina. La secuencia es la habitual de los
+# anunciadores (ISA con reinicio automático): alarma = piloto parpadeante + bocina; aceptar = piloto fijo y
+# bocina parada; condición normal = piloto apagado. NO reproduce el firmware del equipo real.
+# Las alarmas salen como sentencias NMEA 0183 ALR (ver mg_sentences).
+MG_CHANNELS = 8
+MG_WIRE_OFFSET = 100          # identificador ALR de la avería de cable = identificador del canal + 100
+MG_TEST_SECONDS = 3.0
+MG_DEFAULT_NAMES = ["BAJA PRESION ACEITE", "ALTA TEMP REFRIGERANTE", "NIVEL ALTO SENTINA", "FALLO ALTERNADOR",
+                    "BAJO NIVEL COMBUSTIBLE", "ALTA TEMP GASES ESCAPE", "FALLO BOMBA ACHIQUE", "ALARMA GENERAL"]
+
+mg_lock = threading.Lock()
+mg = {
+    "talker": "ER",           # ER = sistema de monitorización de sala de máquinas (configurable)
+    "id_base": 1,             # identificador ALR del canal 1 (el canal n usa id_base + n - 1)
+    "repeat_s": 10.0,         # reenvío periódico de las alarmas que siguen activas
+    "emit": True,
+    "wire_detect": True,      # detección de cable roto (avería aparte, sin alarma de proceso)
+    "horn_silenced": False,
+    "test_until": 0.0,
+    "channels": [{"name": n, "nc": False, "delay_s": 0.0, "enabled": True,
+                  "contact_closed": False, "wire_fault": False} for n in MG_DEFAULT_NAMES],
+    # 8 puntos de alarma de proceso + 8 de avería de cable. Estados: normal, alarm (sin aceptar),
+    # ack (aceptada), rtn (la condición volvió a normal sin haberse aceptado).
+    "points": [{"ch": i % MG_CHANNELS, "kind": "main" if i < MG_CHANNELS else "wire", "state": "normal",
+                "pending_since": None, "changed": None, "last_sent": 0.0, "dirty": False}
+               for i in range(2 * MG_CHANNELS)],
+    "log": collections.deque(maxlen=30),
+}
+
+
+def _nmea_text(raw, limit=32):
+    """Texto seguro para un campo NMEA: ASCII en mayúsculas, sin comas ni asteriscos."""
+    t = unicodedata.normalize("NFKD", str(raw)).encode("ascii", "ignore").decode("ascii").upper()
+    t = "".join(ch for ch in t if ch.isalnum() or ch in " -_./%")
+    return " ".join(t.split())[:limit].strip()
+
+
+def _mg_cond(i, kind):
+    """¿Está el punto en condición de alarma? (mg_lock tomado)."""
+    c = mg["channels"][i]
+    if not c["enabled"]:
+        return False
+    broken = c["wire_fault"] and mg["wire_detect"]
+    if kind == "wire":
+        return broken
+    if broken:
+        return False                              # cable roto detectado: avería, no alarma de proceso
+    closed = c["contact_closed"] and not c["wire_fault"]    # cable roto sin detección = circuito abierto
+    return closed != c["nc"]                      # NA alarma al cerrar, NC alarma al abrir
+
+
+def _mg_set(p, state):
+    p["state"] = state
+    p["changed"] = datetime.now(timezone.utc)
+    p["dirty"] = True
+    p["pending_since"] = None
+
+
+def advance_miniguard(now):
+    """Un paso de la máquina de estados (se llama desde el hilo de simulación)."""
+    with mg_lock:
+        for p in mg["points"]:
+            cond = _mg_cond(p["ch"], p["kind"])
+            st = p["state"]
+            if cond:
+                if st == "normal":
+                    if p["pending_since"] is None:
+                        p["pending_since"] = now
+                    delay = mg["channels"][p["ch"]]["delay_s"] if p["kind"] == "main" else 0.0
+                    if now - p["pending_since"] >= delay:
+                        _mg_set(p, "alarm")
+                        mg["horn_silenced"] = False
+                elif st == "rtn":                 # la condición vuelve antes de aceptar la anterior
+                    _mg_set(p, "alarm")
+                    mg["horn_silenced"] = False
+            else:
+                p["pending_since"] = None
+                if st == "alarm":
+                    _mg_set(p, "rtn")
+                elif st == "ack":
+                    _mg_set(p, "normal")
+
+
+def _mg_horn_on(now):
+    if now < mg["test_until"]:
+        return True
+    return not mg["horn_silenced"] and any(p["state"] == "alarm" for p in mg["points"])
+
+
+def mg_sentences():
+    """ALR por cada cambio de estado, reenvío periódico de las activas y volcado completo al conectar un cliente.
+
+    $--ALR,hhmmss.ss,xxx,A,A,texto  ->  hora del cambio, identificador de alarma,
+    condición (A = en alarma, V = normal), aceptación (A = aceptada, V = sin aceptar), descripción."""
+    now = time.monotonic()
+    refresh = _refresh_due("mg")
+    out = []
+    with mg_lock:
+        talker, repeat, base = mg["talker"], mg["repeat_s"], mg["id_base"]
+        for p in mg["points"]:
+            if not mg["emit"]:
+                p["dirty"] = False
+                continue
+            st = p["state"]
+            active = st != "normal"
+            if not (p["dirty"] or (active and (refresh or now - p["last_sent"] >= repeat - 0.4))):
+                continue
+            wire = p["kind"] == "wire"
+            name = mg["channels"][p["ch"]]["name"]
+            ident = base + p["ch"] + (MG_WIRE_OFFSET if wire else 0)
+            text = f"{name} FALLO CABLE" if wire else name
+            when = (p["changed"] or datetime.now(timezone.utc)).strftime("%H%M%S.00")
+            cond = "A" if st in ("alarm", "ack") else "V"
+            ack = "V" if st in ("alarm", "rtn") else "A"
+            line = nmea_sentence(f"{talker}ALR,{when},{ident:03d},{cond},{ack},{text}")
+            out.append(line)
+            p["last_sent"], p["dirty"] = now, False
+            mg["log"].append(f"{datetime.now(timezone.utc):%H:%M:%S}  {line}")
+    return out
+
+
+def mg_state():
+    now = time.monotonic()
+    with mg_lock:
+        chans = []
+        for i, c in enumerate(mg["channels"]):
+            main, wire = mg["points"][i], mg["points"][MG_CHANNELS + i]
+            pending = None
+            if main["state"] == "normal" and main["pending_since"] is not None:
+                pending = max(0.0, c["delay_s"] - (now - main["pending_since"]))
+            chans.append({**c, "ch": i + 1, "state": main["state"], "wire_state": wire["state"],
+                          "in_alarm": _mg_cond(i, "main"), "pending_left": pending,
+                          "id": mg["id_base"] + i, "wire_id": mg["id_base"] + i + MG_WIRE_OFFSET})
+        states = [p["state"] for p in mg["points"]]
+        return {"channels": chans, "talker": mg["talker"], "id_base": mg["id_base"], "repeat_s": mg["repeat_s"],
+                "emit": mg["emit"], "wire_detect": mg["wire_detect"], "horn": _mg_horn_on(now),
+                "test": now < mg["test_until"], "common": any(st != "normal" for st in states),
+                "unacked": any(st in ("alarm", "rtn") for st in states), "log": list(mg["log"])}
 
 
 # ----------------- SALIDAS UDP / SERIE -----------------
@@ -880,6 +1026,7 @@ def navigation_and_broadcast_worker():
             last = now
             advance_own_ship(dt)
             advance_targets(dt)
+            advance_miniguard(time.monotonic())
             broadcast_nmea()
         except Exception as e:   # noqa: BLE001
             print(f"[!] [WORKER] {type(e).__name__}: {e}")
@@ -1092,6 +1239,98 @@ def api_clear_targets(body):
     return {"status": "ok"}
 
 
+def _mg_idx(body):
+    try:
+        n = int(body["ch"])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("Canal inválido") from None
+    if not 1 <= n <= MG_CHANNELS:
+        raise ValueError(f"El canal debe estar entre 1 y {MG_CHANNELS}")
+    return n - 1
+
+
+def api_mg_contact(body):
+    """Dispara o normaliza la entrada de un canal. `alarm` true/false; sin él, conmuta."""
+    i = _mg_idx(body)
+    with mg_lock:
+        c = mg["channels"][i]
+        want = bool(body["alarm"]) if "alarm" in body else not _mg_cond(i, "main")
+        c["contact_closed"] = (not c["nc"]) if want else c["nc"]
+    return {"status": "ok"}
+
+
+def api_mg_config(body):
+    i = _mg_idx(body)
+    new = {}
+    if "name" in body:
+        new["name"] = _nmea_text(body["name"], 28) or MG_DEFAULT_NAMES[i]
+    if "delay_s" in body:
+        new["delay_s"] = round(_num(body, "delay_s", 0, 600), 1)
+    for key in ("nc", "enabled", "wire_fault"):
+        if key in body:
+            new[key] = bool(body[key])
+    with mg_lock:
+        c = mg["channels"][i]
+        if "nc" in new and new["nc"] != c["nc"]:
+            c["contact_closed"] = new["nc"]       # al cambiar NA/NC la entrada queda en estado normal
+        c.update(new)
+    return {"status": "ok"}
+
+
+def api_mg_ack(body):
+    with mg_lock:
+        for p in mg["points"]:
+            if p["state"] == "alarm":
+                _mg_set(p, "ack")
+            elif p["state"] == "rtn":
+                _mg_set(p, "normal")
+        mg["horn_silenced"] = True
+    return {"status": "ok"}
+
+
+def api_mg_horn_off(body):
+    with mg_lock:
+        mg["horn_silenced"] = True
+    return {"status": "ok"}
+
+
+def api_mg_test(body):
+    with mg_lock:
+        mg["test_until"] = time.monotonic() + MG_TEST_SECONDS
+    return {"status": "ok", "seconds": MG_TEST_SECONDS}
+
+
+def api_mg_reset(body):
+    """Todas las entradas a estado normal y sin cables rotos."""
+    with mg_lock:
+        for c in mg["channels"]:
+            c["contact_closed"] = c["nc"]
+            c["wire_fault"] = False
+    return {"status": "ok"}
+
+
+def api_mg_settings(body):
+    new = {}
+    if "talker" in body:
+        t = str(body["talker"]).strip().upper()
+        if len(t) != 2 or not t.isalpha() or not t.isascii():
+            raise ValueError("El talker son 2 letras (p. ej. ER)")
+        new["talker"] = t
+    if "id_base" in body:
+        new["id_base"] = int(_num(body, "id_base", 0, 800))
+    if "repeat_s" in body:
+        new["repeat_s"] = round(_num(body, "repeat_s", 2, 300), 1)
+    for key in ("emit", "wire_detect"):
+        if key in body:
+            new[key] = bool(body[key])
+    with mg_lock:
+        turned_on = new.get("emit") and not mg["emit"]
+        mg.update(new)
+    if turned_on:
+        request_static_refresh()      # al reactivar la salida se reenvían las alarmas que sigan activas
+    return {"status": "ok"}
+
+
 POST_ROUTES = {
     "/set_pos": api_set_pos,
     "/set_route": api_set_route,
@@ -1104,6 +1343,13 @@ POST_ROUTES = {
     "/outputs/udp": api_add_udp,
     "/outputs/serial": api_add_serial,
     "/outputs/remove": api_remove_output,
+    "/miniguard/contact": api_mg_contact,
+    "/miniguard/config": api_mg_config,
+    "/miniguard/ack": api_mg_ack,
+    "/miniguard/horn_off": api_mg_horn_off,
+    "/miniguard/test": api_mg_test,
+    "/miniguard/reset": api_mg_reset,
+    "/miniguard/settings": api_mg_settings,
 }
 
 
@@ -1227,6 +1473,7 @@ HTML = r"""<!DOCTYPE html>
       <strong>GPS NMEA 0183 SIMULATOR</strong>
       <span class="badge" id="header-port-badge">TCP: 10111</span>
       <span id="route-indicator" class="pill" style="color:#fbbf24;">⚓ Modo Manual</span>
+      <a href="/miniguard" class="pill" style="color:#fda4af; text-decoration:none;">🔔 Mini-Guard 008</a>
     </div>
     <div style="font-size:12px;">
       <button class="btn" id="btn-view" onclick="cycleView()" style="padding:3px 8px" title="Cambiar vista: auto / móvil / escritorio">📱 Auto</button>
@@ -1888,6 +2135,306 @@ HTML = r"""<!DOCTYPE html>
 """
 
 
+HTML_MG = r"""<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>Mini-Guard 008 · Simulador</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <style>
+    :root {
+      --bg: #0b111e; --surface: #111a2e; --card: #1e293b; --line: #334155; --text: #e2e8f0; --muted: #94a3b8;
+      --accent: #38bdf8; --red: #ef4444; --red-dark: #7f1d1d; --lamp-off: #1a0f13; --lamp-line: #3b1d24;
+      --amber: #f59e0b; --amber-dark: #78350f; --green: #10b981;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text);
+           min-height: 100vh; padding-bottom: env(safe-area-inset-bottom); }
+    header { background: var(--surface); border-bottom: 1px solid #1e293b; padding: 10px 16px; display: flex; flex-wrap: wrap;
+             align-items: center; gap: 8px 12px; }
+    header h1 { font-size: 16px; font-weight: 700; margin-right: auto; }
+    header h1 small { font-weight: 400; color: var(--muted); font-size: 12px; margin-left: 6px; }
+    a.back { color: var(--accent); text-decoration: none; font-size: 13px; padding: 6px 4px; }
+    .pill { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; padding: 4px 9px; border-radius: 999px;
+            background: #0b111e; color: var(--muted); border: 1px solid var(--line); white-space: nowrap; }
+    .pill.bad { color: #fecaca; border-color: var(--red); background: #3b0d0d; }
+    .pill.warn { color: #fde68a; border-color: var(--amber); background: #2b1a05; }
+    .pill.good { color: #a7f3d0; border-color: var(--green); }
+    .pill.on { color: #fff; background: var(--red); border-color: var(--red); }
+    main { max-width: 1100px; margin: 0 auto; padding: 14px 16px 28px; display: flex; flex-direction: column; gap: 14px; }
+    section { background: var(--surface); border: 1px solid var(--card); border-radius: 10px; padding: 14px; }
+    h2 { font-size: 12px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin-bottom: 10px; font-weight: 700; }
+
+    /* ---- Panel del anunciador ---- */
+    #lamps { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+    .lamp { background: var(--lamp-off); border: 2px solid var(--lamp-line); border-radius: 8px; padding: 10px; min-height: 104px;
+            display: flex; flex-direction: column; gap: 4px; color: var(--muted); }
+    .lamp-top { display: flex; align-items: center; gap: 6px; }
+    .lamp .num { font-weight: 800; font-size: 18px; color: var(--text); }
+    .lamp-name { font-size: 12.5px; font-weight: 600; line-height: 1.25; color: var(--text); word-break: break-word; flex: 1; }
+    .lamp-state { font-size: 10.5px; letter-spacing: .05em; font-weight: 700; }
+    .lamp.alarm { background: var(--red-dark); border-color: var(--red); color: #fecaca; animation: flash .8s steps(1, end) infinite; }
+    .lamp.ack { background: var(--red-dark); border-color: var(--red); color: #fecaca; }
+    .lamp.rtn { background: var(--amber-dark); border-color: var(--amber); color: #fde68a; animation: flash-rtn 1.6s steps(1, end) infinite; }
+    .lamp.pending { border-style: dashed; border-color: var(--amber); color: #fde68a; }
+    .lamp.off { opacity: .45; }
+    @keyframes flash { 50% { background: var(--lamp-off); border-color: var(--lamp-line); color: var(--muted); } }
+    @keyframes flash-rtn { 50% { background: var(--lamp-off); border-color: var(--lamp-line); color: var(--muted); } }
+    .wire { width: 10px; height: 10px; border-radius: 50%; background: #475569; margin-left: auto; flex: none; }
+    .wire.alarm { background: var(--amber); animation: flash .8s steps(1, end) infinite; }
+    .wire.ack { background: var(--amber); }
+    .wire.rtn { background: var(--amber); animation: flash-rtn 1.6s steps(1, end) infinite; }
+    .wire-tag { font-size: 10px; font-weight: 700; color: #fde68a; }
+    .wire-tag:empty { display: none; }
+    #panel.test .lamp { animation: none; background: var(--red-dark); border-color: #fca5a5; color: #fecaca; opacity: 1; }
+    #panel-btns { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; align-items: center; }
+    .pbtn { flex: 1 1 140px; min-height: 52px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--text);
+            font-size: 14px; font-weight: 700; cursor: pointer; letter-spacing: .03em; }
+    .pbtn:hover { background: #26354c; }
+    .pbtn:active { transform: translateY(1px); }
+    .pbtn.ack { border-color: var(--green); }
+    .pbtn.horn { border-color: var(--amber); }
+    .pbtn.test { border-color: var(--accent); }
+    .note { font-size: 11.5px; color: var(--muted); line-height: 1.45; margin-top: 10px; }
+
+    /* ---- Controles por canal ---- */
+    #chs { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; }
+    .ch { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 10px; display: flex; flex-direction: column; gap: 8px; }
+    .ch-head { display: flex; gap: 8px; align-items: center; }
+    .chnum { font-weight: 800; font-size: 13px; color: var(--accent); flex: none; }
+    .ch-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .ch-opts { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; align-items: end; }
+    label { font-size: 11px; color: var(--muted); display: flex; flex-direction: column; gap: 3px; }
+    label.chk { flex-direction: row; align-items: center; gap: 6px; color: var(--text); font-size: 12.5px; min-height: 32px; }
+    input[type="text"], input[type="number"], select { background: #0b111e; border: 1px solid #475569; color: #f8fafc; padding: 6px 8px;
+            border-radius: 5px; font-size: 13px; width: 100%; min-width: 0; }
+    input[type="checkbox"] { width: 18px; height: 18px; flex: none; }
+    .btn { background: #0284c7; color: #fff; border: none; padding: 8px 12px; border-radius: 5px; font-weight: 700; cursor: pointer; font-size: 13px; min-height: 36px; }
+    .btn:hover { background: #0369a1; }
+    .btn.trig { background: #b45309; }
+    .btn.trig:hover { background: #92400e; }
+    .btn.trig.active { background: #047857; }
+    .btn.trig.active:hover { background: #065f46; }
+    .btn.gray { background: #475569; }
+    .btn.gray:hover { background: #334155; }
+    .contact { font-size: 11.5px; color: var(--muted); }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    /* ---- NMEA ---- */
+    #nmea-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; align-items: end; }
+    #ids { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px; color: #cbd5e1; margin-top: 8px; line-height: 1.5; }
+    #feed { background: #050811; border-radius: 6px; padding: 8px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px; color: #4ade80;
+            height: 190px; overflow: auto; white-space: pre; line-height: 1.4; margin-top: 10px; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; align-items: center; }
+
+    @media (max-width: 600px) {
+      main { padding: 10px 10px 24px; gap: 10px; }
+      section { padding: 12px 10px; }
+      #lamps { grid-template-columns: repeat(2, 1fr); }
+      #chs { grid-template-columns: 1fr; }
+      .btn, input[type="text"], input[type="number"], select { font-size: 16px; }
+      .btn { min-height: 44px; }
+      #feed { font-size: 10px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <a class="back" href="/">← Simulador GPS</a>
+    <h1>Mini-Guard 008<small>anunciador de alarmas de 8 canales (simulación)</small></h1>
+    <span id="common" class="pill good">SIN ALARMAS</span>
+    <span id="horn" class="pill">🔊 BOCINA</span>
+    <button id="btn-sound" class="btn gray" style="min-height:30px;padding:4px 10px;">🔈 Sonido: no</button>
+    <span id="conn" class="pill">● conectando…</span>
+  </header>
+
+  <main>
+    <section id="panel" aria-label="Panel del anunciador">
+      <h2>Panel</h2>
+      <div id="lamps"></div>
+      <div id="panel-btns">
+        <button class="pbtn ack" id="b-ack">ACEPTAR</button>
+        <button class="pbtn horn" id="b-horn">PARAR BOCINA</button>
+        <button class="pbtn test" id="b-test">PRUEBA</button>
+      </div>
+      <p class="note">
+        Alarma: piloto parpadeante y bocina. Aceptar: piloto fijo y bocina parada. Al volver la entrada a normal se apaga;
+        si vuelve antes de aceptar, el piloto sigue parpadeando en ámbar hasta aceptar. Durante la prueba se encienden todos
+        los pilotos y suena la bocina, sin emitir alarmas por NMEA.
+      </p>
+    </section>
+
+    <section aria-label="Entradas">
+      <h2>Entradas (simulación del cableado)</h2>
+      <div id="chs"></div>
+      <div class="row">
+        <button class="btn gray" id="b-reset">Normalizar todas las entradas</button>
+      </div>
+    </section>
+
+    <section aria-label="Salida NMEA">
+      <h2>Salida NMEA 0183 (ALR)</h2>
+      <div id="nmea-grid">
+        <label>Talker (2 letras)<input type="text" id="s-talker" maxlength="2" value="ER" autocapitalize="characters"></label>
+        <label>Id del canal 1<input type="number" id="s-base" min="0" max="800" value="1"></label>
+        <label>Repetir activas cada (s)<input type="number" id="s-repeat" min="2" max="300" step="1" value="10"></label>
+        <label class="chk"><input type="checkbox" id="s-emit" checked> Emitir ALR</label>
+        <label class="chk"><input type="checkbox" id="s-wire" checked> Detección de cable roto</label>
+        <button class="btn" id="b-apply">Aplicar</button>
+      </div>
+      <div id="ids"></div>
+      <div id="feed" tabindex="0" role="log" aria-label="Últimas sentencias emitidas">(sin sentencias aún)</div>
+      <p class="note">
+        Formato: <code>$ERALR,hhmmss.ss,id,A|V,A|V,texto</code>: hora UTC del cambio, identificador de la alarma,
+        condición (A = en alarma, V = normal), aceptación (A = aceptada, V = sin aceptar) y descripción.
+        Se envía en cada cambio y se repite mientras la alarma siga activa; los clientes que se conectan reciben
+        las activas al momento. Sale por los mismos TCP, UDP y puerto serie que el resto del simulador.
+        Es una simulación del comportamiento típico de un anunciador de 8 canales, no el firmware del equipo real.
+      </p>
+    </section>
+  </main>
+
+  <script>
+    (() => {
+      const $ = id => document.getElementById(id);
+      const NCH = 8;
+      const STATE_TXT = { normal: 'NORMAL', alarm: 'ALARMA', ack: 'ACEPTADA', rtn: 'NORMALIZADA · SIN ACEPTAR' };
+      const WIRE_TXT = { alarm: 'FALLO CABLE', ack: 'CABLE ACEPTADO', rtn: 'CABLE OK · SIN ACEPTAR' };
+      let last = null, settingsLoaded = false, soundOn = false, hornOn = false, actx = null;
+
+      const post = (url, data) => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data || {}) })
+        .then(async r => { const d = await r.json().catch(() => ({})); if (!r.ok) throw new Error(d.message || 'Error'); return d; });
+      const act = (url, data) => post(url, data).then(refresh).catch(e => alert(e.message));
+      const setVal = (el, prop, v) => { if (document.activeElement !== el && el[prop] !== v) el[prop] = v; };
+
+      // ---------- construcción ----------
+      for (let i = 1; i <= NCH; i++) {
+        const l = document.createElement('div');
+        l.className = 'lamp normal'; l.id = 'lamp' + i;
+        l.innerHTML = '<div class="lamp-top"><span class="num">' + i + '</span><span class="wire-tag" id="wtag' + i + '"></span><span class="wire" id="wire' + i + '"></span></div>' +
+                      '<div class="lamp-name" id="lname' + i + '"></div><div class="lamp-state" id="lstate' + i + '"></div>';
+        $('lamps').appendChild(l);
+
+        const c = document.createElement('div');
+        c.className = 'ch'; c.id = 'ch' + i;
+        c.innerHTML =
+          '<div class="ch-head"><span class="chnum">CH ' + i + '</span><input type="text" class="f-name" maxlength="28" aria-label="Nombre del canal ' + i + '"></div>' +
+          '<div class="ch-row"><button class="btn trig f-trig">⚠ Disparar alarma</button><span class="contact f-contact"></span></div>' +
+          '<div class="ch-opts">' +
+            '<label>Tipo de contacto<select class="f-type"><option value="no">NA · alarma al cerrar</option><option value="nc">NC · alarma al abrir</option></select></label>' +
+            '<label>Retardo (s)<input type="number" class="f-delay" min="0" max="600" step="0.5"></label>' +
+            '<label class="chk"><input type="checkbox" class="f-enabled"> Canal activo</label>' +
+            '<label class="chk"><input type="checkbox" class="f-wire"> Cable roto</label>' +
+          '</div>';
+        $('chs').appendChild(c);
+
+        c.querySelector('.f-name').addEventListener('change', e => act('/miniguard/config', { ch: i, name: e.target.value }));
+        c.querySelector('.f-type').addEventListener('change', e => act('/miniguard/config', { ch: i, nc: e.target.value === 'nc' }));
+        c.querySelector('.f-delay').addEventListener('change', e => act('/miniguard/config', { ch: i, delay_s: parseFloat(e.target.value) || 0 }));
+        c.querySelector('.f-enabled').addEventListener('change', e => act('/miniguard/config', { ch: i, enabled: e.target.checked }));
+        c.querySelector('.f-wire').addEventListener('change', e => act('/miniguard/config', { ch: i, wire_fault: e.target.checked }));
+        c.querySelector('.f-trig').addEventListener('click', () => {
+          const cur = last && last.channels[i - 1];
+          act('/miniguard/contact', { ch: i, alarm: !(cur && cur.in_alarm) });
+        });
+      }
+
+      // ---------- pintado ----------
+      function render(st) {
+        last = st;
+        $('panel').classList.toggle('test', st.test);
+        st.channels.forEach(c => {
+          const i = c.ch, l = $('lamp' + i);
+          const pending = c.pending_left !== null;
+          l.className = 'lamp ' + (!c.enabled ? 'off' : (pending ? 'pending' : c.state));
+          $('lname' + i).textContent = c.name;
+          $('lstate' + i).textContent = !c.enabled ? 'DESACTIVADO' : (pending ? 'RETARDO ' + c.pending_left.toFixed(1) + ' s' : STATE_TXT[c.state]);
+          $('wire' + i).className = 'wire ' + c.wire_state;
+          $('wtag' + i).textContent = WIRE_TXT[c.wire_state] || '';
+
+          const root = $('ch' + i);
+          setVal(root.querySelector('.f-name'), 'value', c.name);
+          setVal(root.querySelector('.f-type'), 'value', c.nc ? 'nc' : 'no');
+          const dl = root.querySelector('.f-delay');
+          if (document.activeElement !== dl && Number(dl.value) !== c.delay_s) dl.value = c.delay_s;
+          setVal(root.querySelector('.f-enabled'), 'checked', c.enabled);
+          setVal(root.querySelector('.f-wire'), 'checked', c.wire_fault);
+          const trig = root.querySelector('.f-trig');
+          trig.textContent = c.in_alarm ? '✔ Normalizar entrada' : '⚠ Disparar alarma';
+          trig.classList.toggle('active', c.in_alarm);
+          root.querySelector('.f-contact').textContent = 'Contacto ' + (c.contact_closed && !c.wire_fault ? 'cerrado' : 'abierto') + (c.wire_fault ? ' (cable roto)' : '');
+        });
+
+        const common = $('common');
+        common.textContent = st.common ? (st.unacked ? 'ALARMA SIN ACEPTAR' : 'ALARMAS ACEPTADAS') : 'SIN ALARMAS';
+        common.className = 'pill ' + (st.common ? (st.unacked ? 'bad' : 'warn') : 'good');
+        hornOn = st.horn;
+        $('horn').className = 'pill' + (st.horn ? ' on' : '');
+
+        if (!settingsLoaded) {
+          $('s-talker').value = st.talker; $('s-base').value = st.id_base; $('s-repeat').value = st.repeat_s;
+          $('s-emit').checked = st.emit; $('s-wire').checked = st.wire_detect;
+          settingsLoaded = true;
+        }
+        const pad = n => String(n).padStart(3, '0');
+        $('ids').textContent = 'Canal 1 → ' + st.talker + 'ALR id ' + pad(st.id_base) + ' … canal 8 → id ' + pad(st.id_base + 7) +
+                               ' · avería de cable: id + 100 (' + pad(st.id_base + 100) + ' … ' + pad(st.id_base + 107) + ')';
+        const feed = $('feed'), atEnd = feed.scrollTop + feed.clientHeight >= feed.scrollHeight - 20;
+        feed.textContent = st.log.length ? st.log.join('\n') : '(sin sentencias aún)';
+        if (atEnd) feed.scrollTop = feed.scrollHeight;
+      }
+
+      function setConn(ok) {
+        const el = $('conn');
+        el.textContent = ok ? '● en línea' : '● sin conexión';
+        el.className = 'pill ' + (ok ? 'good' : 'bad');
+      }
+
+      function refresh() {
+        return fetch('/miniguard/state').then(r => r.json()).then(st => { setConn(true); render(st); }).catch(() => setConn(false));
+      }
+
+      // ---------- botones ----------
+      $('b-ack').addEventListener('click', () => act('/miniguard/ack'));
+      $('b-horn').addEventListener('click', () => act('/miniguard/horn_off'));
+      $('b-test').addEventListener('click', () => act('/miniguard/test'));
+      $('b-reset').addEventListener('click', () => act('/miniguard/reset'));
+      $('b-apply').addEventListener('click', () => {
+        post('/miniguard/settings', {
+          talker: $('s-talker').value, id_base: parseInt($('s-base').value), repeat_s: parseFloat($('s-repeat').value),
+          emit: $('s-emit').checked, wire_detect: $('s-wire').checked
+        }).then(refresh).catch(e => alert(e.message));
+      });
+      $('s-talker').addEventListener('input', e => { e.target.value = e.target.value.toUpperCase().replace(/[^A-Z]/g, ''); });
+
+      // ---------- bocina (opcional, el navegador exige un clic para permitir audio) ----------
+      $('btn-sound').addEventListener('click', () => {
+        soundOn = !soundOn;
+        try {
+          if (soundOn && !actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+          if (actx && actx.state === 'suspended') actx.resume();
+        } catch (e) { soundOn = false; }
+        $('btn-sound').textContent = soundOn ? '🔊 Sonido: sí' : '🔈 Sonido: no';
+      });
+      setInterval(() => {
+        if (!soundOn || !hornOn || !actx) return;
+        try {
+          const o = actx.createOscillator(), g = actx.createGain();
+          o.type = 'square'; o.frequency.value = 620; g.gain.value = 0.05;
+          o.connect(g); g.connect(actx.destination);
+          o.start(); o.stop(actx.currentTime + 0.25);
+        } catch (e) { /* sin audio */ }
+      }, 500);
+
+      setInterval(refresh, 700);
+      refresh();
+    })();
+  </script>
+</body>
+</html>
+"""
+
+
 class FastHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
@@ -1912,6 +2459,10 @@ class FastHandler(BaseHTTPRequestHandler):
             self._send(200, HTML.encode("utf-8"), "text/html; charset=utf-8")
         elif path == "/status":
             self._send(200, snapshot_status(), cors=True)
+        elif path in ("/miniguard", "/miniguard/"):
+            self._send(200, HTML_MG.encode("utf-8"), "text/html; charset=utf-8")
+        elif path == "/miniguard/state":
+            self._send(200, mg_state())
         elif path == "/serial_ports":
             self._send(200, {"available": serial is not None, "ports": list_serial_ports()})
         elif path == "/targets":

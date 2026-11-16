@@ -35,6 +35,22 @@ El mapa (Leaflet y OpenStreetMap) necesita Internet.
   - **Mensajes de seguridad:** mensaje 14 de texto libre, de un solo envío.
 - Los mensajes lentos (nombres AIS, `WPL`, `RTE`) se reenvían de inmediato cuando se conecta un cliente o salida nueva.
 
+## Mini-Guard 008 (pantalla `/miniguard`)
+
+Segunda pantalla (enlace «🔔 Mini-Guard 008» en la cabecera) que simula un anunciador de alarmas de 8 canales tipo
+Praxis Mini-Guard 008 y emite las alarmas por NMEA por los mismos TCP, UDP y puerto serie.
+
+- Por canal: nombre, contacto NA/NC, retardo individual, activar/desactivar, disparo de la entrada y simulación de cable roto.
+- Botones: ACEPTAR, PARAR BOCINA y PRUEBA de lámparas (la prueba no emite alarmas). Bocina opcional en el navegador.
+- Salida: `$ERALR,hhmmss.ss,id,A|V,A|V,texto*hh` (hora UTC del cambio, id de alarma, condición A=alarma/V=normal,
+  aceptación A=aceptada/V=sin aceptar). Se envía en cada cambio, se repite mientras esté activa y se vuelca al conectar un cliente.
+- Ids: canales 1-8 → `id_base`…`id_base+7` (por defecto 001-008); avería de cable → +100 (101-108).
+  Talker (por defecto `ER`), id base, periodo de repetición y detección de cable roto son configurables.
+
+**Importante:** el formato NMEA es un diseño propio basado en la sentencia estándar ALR; el equipo real no está documentado
+(en lo que he podido consultar) con salida NMEA. La secuencia de pilotos y bocina es la habitual de un anunciador, no el firmware real.
+La recepción de `$--ACK` no está implementada.
+
 ## Salidas
 - **TCP:** todos los clientes conectados al puerto `--tcp-port`.
 - **UDP:** una sentencia por datagrama (lo más compatible). Se pueden añadir y quitar desde la web.
