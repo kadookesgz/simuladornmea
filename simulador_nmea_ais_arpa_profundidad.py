@@ -2198,7 +2198,7 @@ HTML_MG = r"""<!DOCTYPE html>
     .note { font-size: 11.5px; color: var(--muted); line-height: 1.45; margin-top: 10px; }
 
     /* ---- Controles por canal ---- */
-    #chs { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; }
+    #chs { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 10px; }
     .ch { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 10px; display: flex; flex-direction: column; gap: 8px; }
     .ch-head { display: flex; gap: 8px; align-items: center; }
     .chnum { font-weight: 800; font-size: 13px; color: var(--accent); flex: none; }
@@ -2321,7 +2321,7 @@ HTML_MG = r"""<!DOCTYPE html>
           '<div class="ch-head"><span class="chnum">CH ' + i + '</span><input type="text" class="f-name" maxlength="28" aria-label="Nombre del canal ' + i + '"></div>' +
           '<div class="ch-row"><button class="btn trig f-trig">⚠ Disparar alarma</button><span class="contact f-contact"></span></div>' +
           '<div class="ch-opts">' +
-            '<label>Tipo de contacto<select class="f-type"><option value="no">NA · alarma al cerrar</option><option value="nc">NC · alarma al abrir</option></select></label>' +
+            '<label>Tipo de contacto<select class="f-type"><option value="no">NA (alarma al cerrar)</option><option value="nc">NC (alarma al abrir)</option></select></label>' +
             '<label>Retardo (s)<input type="number" class="f-delay" min="0" max="600" step="0.5"></label>' +
             '<label class="chk"><input type="checkbox" class="f-enabled"> Canal activo</label>' +
             '<label class="chk"><input type="checkbox" class="f-wire"> Cable roto</label>' +
@@ -2356,7 +2356,7 @@ HTML_MG = r"""<!DOCTYPE html>
           setVal(root.querySelector('.f-name'), 'value', c.name);
           setVal(root.querySelector('.f-type'), 'value', c.nc ? 'nc' : 'no');
           const dl = root.querySelector('.f-delay');
-          if (document.activeElement !== dl && Number(dl.value) !== c.delay_s) dl.value = c.delay_s;
+          if (document.activeElement !== dl && (dl.value === '' || Number(dl.value) !== c.delay_s)) dl.value = c.delay_s;
           setVal(root.querySelector('.f-enabled'), 'checked', c.enabled);
           setVal(root.querySelector('.f-wire'), 'checked', c.wire_fault);
           const trig = root.querySelector('.f-trig');
